@@ -96,9 +96,9 @@ jobs:
             cp "$dir"/* "pkg/$platform/mpv-mitm-proxy/"
             
             if [[ "$platform" == *"windows"* ]]; then
-              (cd "pkg/$platform" && zip -r "../../assets/mpv-mitm-proxy-$platform.zip" .)
+              (cd "pkg/$platform" && zip -r "../../assets/$platform.zip" .)
             else
-              (cd "pkg/$platform" && tar -czf "../../assets/mpv-mitm-proxy-$platform.tar.gz" .)
+              (cd "pkg/$platform" && tar -czf "../../assets/$platform.tar.gz" .)
             fi
           done
 
