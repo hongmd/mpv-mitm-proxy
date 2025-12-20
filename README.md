@@ -18,40 +18,44 @@ A high-performance MITM proxy that enables seamless YouTube streaming in mpv, wi
 
 ## Installation
 
-### 1. Build the Proxy
+### 1. Download or Build
 
-To build the proxy for your current platform:
+#### Download
+Download the latest release for your platform. The package contains:
+- `main.lua` (The mpv script)
+- `mpv-mitm-proxy` (The proxy binary)
 
+#### Build
+If you prefer to build from source:
 ```bash
 cargo build --release
 ```
+The binary will be located at `target/release/mpv-mitm-proxy`.
 
-The binary will be located at `target/release/mpv-mitm-proxy`. For the Lua script to find it, you should either:
-- Add the `target/release` directory to your system `PATH`.
-- Move the `mpv-mitm-proxy` binary to a standard location like `/usr/local/bin/`.
-- Place the binary in the same folder as the Lua script (see `mitm_rust_proxy.lua` for search logic).
-- Edit `local script_dir = "[directory of mpv-mitm-proxy]"` in `mitm_rust_proxy.lua` to the directory of the binary.
+### 2. Install to mpv
 
-### 2. Configure the Lua Script
+Create a new folder named `mpv-mitm-proxy` inside your mpv `scripts` directory:
+- **Linux/macOS**: `~/.config/mpv/scripts/mpv-mitm-proxy/`
+- **Windows**: `%APPDATA%\mpv\scripts\mpv-mitm-proxy\`
 
-Copy `mitm_rust_proxy.lua` to your mpv scripts directory (usually `~/.config/mpv/scripts/` on Linux/macOS or `%APPDATA%\mpv\scripts\` on Windows).
+Place both the binary (`mpv-mitm-proxy` or `mpv-mitm-proxy.exe`) and the Lua script (`main.lua` or `mitm_rust_proxy.lua`) into that folder.
 
-By default, the script is configured to use **no upstream proxy** (direct connection). You can modify this at the top of `mitm_rust_proxy.lua`:
+### 3. Configuration (Optional)
 
-- **To use an upstream proxy**: 
-  ```lua
-  local upstream_socks5_url = "socks5://127.0.0.1:1080"
-  ```
-- **To use NO upstream proxy** (direct connection): 
+You can modify the upstream proxy settings at the top of the Lua script:
+
+- **Direct connection (No upstream)**:
   ```lua
   local upstream_socks5_url = ""
   ```
-
-Ensure the `proxy_binary` path or `find_binary` logic matches your system.
+- **Upstream SOCKS5 proxy**:
+  ```lua
+  local upstream_socks5_url = "socks5://127.0.0.1:1080"
+  ```
 
 ## Usage
 
-The script automatically starts the proxy when you open a URL from supported domains (YouTube, etc.).
+The script automatically starts and configures the proxy whenever you open a URL that triggers `yt-dlp` in mpv.
 
 Press `Shift+P` (P) in mpv to check the proxy status.
 
