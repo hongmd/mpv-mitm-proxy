@@ -28,7 +28,13 @@ local function cleanup()
 end
 
 local function find_binary()
-    local paths = {proxy_binary, script_dir .. "/../proxy/mpv-mitm-proxy", script_dir .. "/mpv-mitm-proxy"}
+    local paths = {
+        proxy_binary,
+        script_dir .. "/../proxy/" .. proxy_binary,
+        script_dir .. "/" .. proxy_binary,
+        script_dir .. "/mpv-mitm-proxy.exe",
+        script_dir .. "/mpv-mitm-proxy"
+    }
     for _, path in ipairs(paths) do
         local f = io.open(path, "r")
         if f then
@@ -71,9 +77,34 @@ end
 
 local start_proxy_background
 
+local function is_ytdl_applicable()
+    local path = mp.get_property("path")
+    if not path then return false end
+    
+    -- Check if it's a URL
+    if not (path:find("://") or path:find("^[a-zA-Z0-9.-]+:[0-9]+")) then
+        return false
+    end
+
+    -- If ytdl is explicitly disabled, we don't trigger
+    if mp.get_property_native("ytdl") == false then
+        return false
+    end
+
+    -- For simplicity and following user request "only trigger if mpv is going to use yt-dl"
+    -- We'll check if it's NOT a local file and not a known non-ytdl protocol
+    local non_ytdl_protos = {"rtsp://", "rtmp://", "mms://", "dvb://"}
+    for _, proto in ipairs(non_ytdl_protos) do
+        if path:lower():find(proto, 1, true) == 1 then
+            return false
+        end
+    end
+
+    return true
+end
+
 local function on_load_hook()
-    local url = mp.get_property("path")
-    if not (url and (url:find("youtu") or url:find("piped") or url:find("yewtu"))) then
+    if not is_ytdl_applicable() then
         return
     end
 
@@ -83,8 +114,7 @@ local function on_load_hook()
 end
 
 local function on_start_file()
-    local url = mp.get_property("path")
-    if not (url and (url:find("youtu") or url:find("piped") or url:find("yewtu"))) then
+    if not is_ytdl_applicable() then
         return
     end
 
@@ -163,5 +193,3 @@ end
 mp.add_hook("on_load", -1, on_load_hook)
 mp.register_event("start-file", on_start_file)
 mp.register_event("shutdown", cleanup)
-
-start_proxy_background()
