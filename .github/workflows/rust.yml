@@ -56,18 +56,20 @@ jobs:
     - name: Prepare artifact
       shell: bash
       run: |
+        mkdir -p dist
+        cp mitm_rust_proxy.lua dist/main.lua
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
-          cp target/${{ matrix.target }}/release/mpv-mitm-proxy.exe ${{ matrix.asset_name }}
+          cp target/${{ matrix.target }}/release/mpv-mitm-proxy.exe dist/mpv-mitm-proxy.exe
         else
-          cp target/${{ matrix.target }}/release/mpv-mitm-proxy ${{ matrix.asset_name }}
-          chmod +x ${{ matrix.asset_name }}
+          cp target/${{ matrix.target }}/release/mpv-mitm-proxy dist/mpv-mitm-proxy
+          chmod +x dist/mpv-mitm-proxy
         fi
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        path: ${{ matrix.asset_name }}
+        path: dist/*
 
   release:
     name: Create Release
@@ -86,7 +88,19 @@ jobs:
       - name: Prepare assets
         run: |
           mkdir assets
-          find artifacts -type f -exec cp {} assets/ \;
+          # For each platform's artifacts, we want to create a zip/tarball containing main.lua and the binary
+          for dir in artifacts/*; do
+            platform=$(basename "$dir")
+            echo "Packaging $platform..."
+            mkdir -p "pkg/$platform/mpv-mitm-proxy"
+            cp "$dir"/* "pkg/$platform/mpv-mitm-proxy/"
+            
+            if [[ "$platform" == *"windows"* ]]; then
+              (cd "pkg/$platform" && zip -r "../../assets/mpv-mitm-proxy-$platform.zip" .)
+            else
+              (cd "pkg/$platform" && tar -czf "../../assets/mpv-mitm-proxy-$platform.tar.gz" .)
+            fi
+          done
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
