@@ -58,6 +58,7 @@ jobs:
       run: |
         mkdir -p dist
         cp mitm_rust_proxy.lua dist/main.lua
+        cp proxies.txt dist/proxies.txt
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
           cp target/${{ matrix.target }}/release/mpv-mitm-proxy.exe dist/mpv-mitm-proxy.exe
         else
