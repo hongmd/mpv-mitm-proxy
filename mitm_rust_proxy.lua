@@ -4,18 +4,18 @@ local utils = require 'mp.utils'
 
 local opts = {
     use_proxies = false,
+    proxy_rotation_enabled = true,
     cooldown_hours = 16,
     fallback_to_direct = true
 }
 options.read_options(opts, "mitm_rust_proxy")
 
-local mitm_job = nil      -- Handle for the asynchronous proxy process
-local proxy_port = nil    -- Port on which the local proxy binary is listening
-local proxy_ready = false -- Becomes true once the local port is confirmed to be open
+local mitm_job = nil
+local proxy_port = nil
+local proxy_ready = false
 local script_dir = mp.get_script_directory() or "."
 local proxy_binary = "mpv-mitm-proxy"
 
--- Proxy Rotation State
 local proxies = {}
 local current_proxy_index = 0
 local blocked_proxies = {} -- url -> timestamp
@@ -73,6 +73,9 @@ local function get_next_proxy()
         current_proxy_index = (current_proxy_index % #proxies) + 1
         local url = proxies[current_proxy_index]
         
+        -- Rotation enabled usually means respect cooldowns
+        -- If we want to disable cooldowns but keep rotation, that's different.
+        -- But based on user feedback, "proxy_rotation_enabled" should control the loop.
         if not blocked_proxies[url] or (now - blocked_proxies[url] >= cooldown_sec) then
             blocked_proxies[url] = nil
             return url
@@ -254,8 +257,7 @@ start_proxy_background = function()
 end
 
 local function rotate_proxy()
-    if not opts.use_proxies then return end
-    
+    -- This handles the actual rotation work
     local blocked_url = proxies[current_proxy_index]
     if blocked_url then
         blocked_proxies[blocked_url] = os.time()
@@ -292,16 +294,19 @@ mp.register_event("shutdown", cleanup)
 
 mp.enable_messages("warn")
 mp.register_event("log-message", function(e)
+    if not opts.use_proxies or not opts.proxy_rotation_enabled then return end
+
     if e.prefix == "ytdl_hook" then
-        if e.text:lower():find("sign in to confirm you're not a bot") then
+        local msg = e.text:lower()
+        if msg:find("sign in to confirm you") and msg:find("not a bot") then
+            mp.msg.warn("Bot detection detected in log, rotating proxy...")
             rotate_proxy()
         end
     end
 end)
 
 mp.add_hook("on_load_fail", 50, function()
-    if not opts.use_proxies then return end
-    rotate_proxy()
+    -- Generic load fail rotation is disabled as per user request.
 end)
 
 local function show_status()
