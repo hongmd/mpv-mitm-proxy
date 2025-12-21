@@ -1,22 +1,86 @@
--- Set to empty string "" to use NO upstream proxy
--- Example: local upstream_socks5_url = "socks5://127.0.0.1:1080"
-local upstream_socks5_url = ""
 local mp = require 'mp'
 local options = require 'mp.options'
+local utils = require 'mp.utils'
 
 local opts = {
+    use_proxies = false,
+    cooldown_hours = 16,
+    fallback_to_direct = true
 }
 options.read_options(opts, "mitm_rust_proxy")
 
-local mitm_job = nil
-local proxy_port = nil
-local proxy_ready = false
+local mitm_job = nil      -- Handle for the asynchronous proxy process
+local proxy_port = nil    -- Port on which the local proxy binary is listening
+local proxy_ready = false -- Becomes true once the local port is confirmed to be open
 local script_dir = mp.get_script_directory() or "."
 local proxy_binary = "mpv-mitm-proxy"
 
-mp.add_key_binding("P", "proxy-status", function()
-    mp.osd_message((proxy_ready and "🟢" or "🔴") .. " " .. (proxy_port or "none"))
-end)
+-- Proxy Rotation State
+local proxies = {}
+local current_proxy_index = 0
+local blocked_proxies = {} -- url -> timestamp
+local proxy_file = script_dir .. "/proxies.txt"
+local cooldown_file = script_dir .. "/proxy_cooldowns.json"
+
+local function load_proxies()
+    proxies = {}
+    local f = io.open(proxy_file, "r")
+    if f then
+        for line in f:lines() do
+            line = line:gsub("%s+", "")
+            if line ~= "" and not line:find("^#") then
+                table.insert(proxies, line)
+            end
+        end
+        f:close()
+    end
+end
+
+local function load_cooldowns()
+    local f = io.open(cooldown_file, "r")
+    if f then
+        local content = f:read("*all")
+        f:close()
+        local data = utils.parse_json(content)
+        if data then
+            local now = os.time()
+            local cooldown_sec = opts.cooldown_hours * 3600
+            for url, timestamp in pairs(data) do
+                if now - timestamp < cooldown_sec then
+                    blocked_proxies[url] = timestamp
+                end
+            end
+        end
+    end
+end
+
+local function save_cooldowns()
+    local f = io.open(cooldown_file, "w")
+    if f then
+        local success, json = pcall(utils.format_json, blocked_proxies)
+        if success then f:write(json) end
+        f:close()
+    end
+end
+
+local function get_next_proxy()
+    if #proxies == 0 then return nil end
+    
+    local now = os.time()
+    local cooldown_sec = opts.cooldown_hours * 3600
+    
+    for i = 1, #proxies do
+        current_proxy_index = (current_proxy_index % #proxies) + 1
+        local url = proxies[current_proxy_index]
+        
+        if not blocked_proxies[url] or (now - blocked_proxies[url] >= cooldown_sec) then
+            blocked_proxies[url] = nil
+            return url
+        end
+    end
+    
+    return nil
+end
 
 local function cleanup()
     if mitm_job then
@@ -63,6 +127,12 @@ local function check_port_open(port)
 end
 
 local function apply_proxy_settings()
+    if not proxy_port then
+        mp.set_property("file-local-options/http-proxy", "")
+        mp.set_property("file-local-options/ytdl-raw-options", "")
+        return
+    end
+
     local px = "http://127.0.0.1:" .. proxy_port
     mp.set_property("file-local-options/http-proxy", px)
     mp.set_property("file-local-options/tls-verify", "no")
@@ -71,8 +141,6 @@ local function apply_proxy_settings()
         "proxy=" .. px .. "," ..
         "force-ipv4=," ..
         "no-check-certificates=,")
-    
-    mp.msg.info("Using proxy on port " .. proxy_port)
 end
 
 local start_proxy_background
@@ -81,18 +149,14 @@ local function is_ytdl_applicable()
     local path = mp.get_property("path")
     if not path then return false end
     
-    -- Check if it's a URL
     if not (path:find("://") or path:find("^[a-zA-Z0-9.-]+:[0-9]+")) then
         return false
     end
 
-    -- If ytdl is explicitly disabled, we don't trigger
     if mp.get_property_native("ytdl") == false then
         return false
     end
 
-    -- For simplicity and following user request "only trigger if mpv is going to use yt-dl"
-    -- We'll check if it's NOT a local file and not a known non-ytdl protocol
     local non_ytdl_protos = {"rtsp://", "rtmp://", "mms://", "dvb://"}
     for _, proto in ipairs(non_ytdl_protos) do
         if path:lower():find(proto, 1, true) == 1 then
@@ -130,12 +194,9 @@ local function on_start_file()
         return
     end
 
-    mp.add_timeout(1, function()
-        if proxy_ready then
-            return
-        end
-
-        if check_port_open(proxy_port) then
+    mp.add_timeout(0.5, function()
+        if proxy_ready then return end
+        if proxy_port and check_port_open(proxy_port) then
             proxy_ready = true
             mp.msg.info("Proxy ready on port " .. proxy_port)
         end
@@ -143,22 +204,31 @@ local function on_start_file()
 end
 
 start_proxy_background = function()
-    if proxy_ready and proxy_port and mitm_job then return end
-    if mitm_job then return end
+    if mitm_job then cleanup() end
     
     local bin = find_binary()
     if not bin then return end
     
+    local upstream = nil
+    if opts.use_proxies then
+        upstream = get_next_proxy()
+        if not upstream then
+            if #proxies > 0 then
+                mp.osd_message("All proxies are blocked!", 5)
+            end
+            if not opts.fallback_to_direct then
+                return
+            end
+        end
+    end
+
     math.randomseed(os.time())
     local port_attempt = math.random(15000, 25000)
     
-    mp.msg.info("Starting proxy on port " .. port_attempt .. "...")
-    local start_time = mp.get_time()
-    
     local args = {bin, "--port", tostring(port_attempt)}
-    if upstream_socks5_url and upstream_socks5_url ~= "" then
+    if upstream then
         table.insert(args, "--upstream")
-        table.insert(args, upstream_socks5_url)
+        table.insert(args, upstream)
     end
 
     mitm_job = mp.command_native_async({
@@ -168,28 +238,83 @@ start_proxy_background = function()
         capture_stderr = true,
         playback_only = false
     }, function(success, result, error)
-        mp.msg.info("Proxy process ended")
-        if result and result.stderr and result.stderr ~= "" then
-            mp.msg.error("Proxy stderr: " .. result.stderr)
-        end
         proxy_ready = false
         mitm_job = nil
     end)
     
     proxy_port = port_attempt
     
-    mp.add_timeout(1, function()
-        if proxy_ready then
-            return
-        end
-
-        if check_port_open(port_attempt) then
+    mp.add_timeout(0.5, function()
+        if proxy_ready then return end
+        if proxy_port and check_port_open(port_attempt) then
             proxy_ready = true
             mp.msg.info("Proxy ready on port " .. proxy_port)
         end
     end)
 end
 
+local function rotate_proxy()
+    if not opts.use_proxies then return end
+    
+    local blocked_url = proxies[current_proxy_index]
+    if blocked_url then
+        blocked_proxies[blocked_url] = os.time()
+        save_cooldowns()
+        mp.osd_message("Proxy blocked, rotating...", 3)
+        mp.msg.warn("Proxy " .. blocked_url .. " blocked, rotating...")
+    end
+    
+    cleanup()
+    
+    mp.add_timeout(0.2, function()
+        start_proxy_background()
+        
+        local check_count = 0
+        local function wait_and_reload()
+            if proxy_ready then
+                apply_proxy_settings()
+                local path = mp.get_property("path")
+                if path then
+                    mp.commandv("loadfile", path, "replace")
+                end
+            elseif check_count < 10 then
+                check_count = check_count + 1
+                mp.add_timeout(0.2, wait_and_reload)
+            end
+        end
+        wait_and_reload()
+    end)
+end
+
 mp.add_hook("on_load", -1, on_load_hook)
 mp.register_event("start-file", on_start_file)
 mp.register_event("shutdown", cleanup)
+
+mp.enable_messages("warn")
+mp.register_event("log-message", function(e)
+    if e.prefix == "ytdl_hook" then
+        if e.text:lower():find("sign in to confirm you're not a bot") then
+            rotate_proxy()
+        end
+    end
+end)
+
+mp.add_hook("on_load_fail", 50, function()
+    if not opts.use_proxies then return end
+    rotate_proxy()
+end)
+
+local function show_status()
+    local status = (proxy_ready and "🟢" or "🔴")
+    if not opts.use_proxies then status = "⚪ (direct)" end
+    local upstream = proxies[current_proxy_index] or "direct"
+    if not proxy_port then upstream = "none" end
+    mp.osd_message(status .. " Port: " .. (proxy_port or "N/A") .. "\nUpstream: " .. upstream)
+end
+
+mp.add_key_binding("P", "proxy-status", show_status)
+
+-- Initialization
+load_proxies()
+load_cooldowns()
+save_cooldowns() -- Clean up expired on start
