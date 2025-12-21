@@ -48,7 +48,6 @@ pub enum ProxyError {
     UrlParse(#[from] url::ParseError),
 }
 
-/// Pooled connection entry with TTL tracking
 struct PooledConnection {
     sender: SendRequest<Incoming>,
     created_at: Instant,
@@ -67,13 +66,8 @@ struct ConnKey {
     is_tls: bool,
 }
 
-/// Connection pool for reusing upstream connections
 struct ConnectionPool {
-    // DashMap for concurrent access to different hosts
-    // Each entry is a Mutex protected Vec of connections for that host
     pool: DashMap<ConnKey, Mutex<Vec<PooledConnection>>>,
-    // LRU cache to track which hosts were used recently for eviction
-    // Also tracks total connection count
     state: Mutex<(LruCache<ConnKey, ()>, usize)>,
 }
 
@@ -89,9 +83,6 @@ impl ConnectionPool {
     }
 
     fn get(&self, host: &str, port: u16, is_tls: bool) -> Option<SendRequest<Incoming>> {
-        // Using a reference key variant to avoid allocation if it's already in the map
-        // Since we don't have custom borrow implemented correctly yet, 
-        // we'll stick to the simpler version but I've already optimized other hot paths.
         let key = ConnKey {
             host: host.to_string(),
             port,
@@ -119,7 +110,6 @@ impl ConnectionPool {
         {
             let mut state = self.state.lock();
             if state.1 >= CONNECTION_POOL_SIZE {
-                // Evict something if we're at limit
                 if let Some((old_key, _)) = state.0.pop_lru() {
                     if let Some((_, conns_mutex)) = self.pool.remove(&old_key) {
                         let removed_count = conns_mutex.lock().len();
@@ -152,23 +142,16 @@ impl ConnectionPool {
             let after = conns.len();
             total_removed += before - after;
             
-            if after == 0 {
-                // If no connections left for this host, remove from pool
-                false
-            } else {
-                true
-            }
+            after != 0
         });
 
         if total_removed > 0 {
             let mut state = self.state.lock();
             state.1 = state.1.saturating_sub(total_removed);
-            // We don't necessarily want to remove from LRU here as it manages "recent usage"
         }
     }
 }
 
-/// A body wrapper that returns the connection to the pool when the body is fully consumed
 struct BodyWithPoolReturn {
     inner: Incoming,
     pool: Arc<ConnectionPool>,
@@ -234,9 +217,7 @@ impl Body for BodyWithPoolReturn {
 }
 
 impl Drop for BodyWithPoolReturn {
-    fn drop(&mut self) {
-        // If dropped before completion, don't return to pool
-    }
+    fn drop(&mut self) {}
 }
 
 pub struct ProxyConfig {
@@ -290,7 +271,6 @@ impl ProxyConfig {
         server_http1_builder.preserve_header_case(true);
         server_http1_builder.title_case_headers(true);
 
-        // Spawn cleanup task
         let pool_clone = Arc::clone(&connection_pool);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -346,18 +326,16 @@ impl ProxyConfig {
         res
     }
 
-    /// Unified connection creation for both HTTP and HTTPS
     async fn get_or_create_connection(
         &self,
         host_str: &str,
         port: u16,
         is_tls: bool,
     ) -> Result<SendRequest<Incoming>, ProxyError> {
-        // Try to get pooled connection
         while let Some(mut sender) = self.connection_pool.get(host_str, port, is_tls) {
             match sender.ready().await {
                 Ok(_) => return Ok(sender),
-                Err(_) => continue, // Try next connection
+                Err(_) => continue,
             }
         }
 
@@ -560,7 +538,6 @@ fn strip_hop_by_hop_headers<T>(req: &mut Request<T>) {
 
 #[inline]
 fn modify_request_headers<T>(req: &mut Request<T>, host: &str) -> bool {
-    // Fast path using byte check if possible, or just ends_with which is optimized in Rust
     if !host.ends_with("googlevideo.com") {
         return false;
     }
@@ -617,7 +594,6 @@ fn push_u64(buf: &mut Vec<u8>, n: u64) {
     buf.extend_from_slice(itoa_buf.format(n).as_bytes());
 }
 
-/// Unified request forwarding for both HTTP and HTTPS
 async fn forward_request(
     mut req: Request<Incoming>,
     host: &str,
@@ -630,7 +606,6 @@ async fn forward_request(
 
     let mut sender = config.get_or_create_connection(host, port, is_tls).await?;
 
-    // Create Host header value once
     let default_port = if is_tls { 443 } else { 80 };
     let host_header = if port == default_port {
         http::HeaderValue::from_str(host)
@@ -688,7 +663,6 @@ async fn handle_http(
     req: Request<Incoming>,
     config: Arc<ProxyConfig>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
-    // Fast path for health check
     if (req.method() == Method::GET || req.method() == Method::HEAD) && req.uri().path() == "/" {
         return Ok(Response::builder()
             .status(StatusCode::OK)
