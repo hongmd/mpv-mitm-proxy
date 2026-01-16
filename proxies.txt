@@ -1,3 +1,15 @@
-# socks5://proxy1.example.com:1080
-# socks5://proxy2.example.com:1080
-# socks5://127.0.0.1:9050
+# Upstream proxy configuration examples
+# Only the first uncommented line will be used
+
+# SOCKS5 proxy formats:
+# socks5://host:port
+# socks5://username:password@host:port
+# socks5://127.0.0.1:1080
+# socks5://user:pass@proxy.example.com:1080
+
+# HTTP/HTTPS proxy formats:
+# http://host:port
+# http://username:password@host:port
+# http://127.0.0.1:8080
+# http://user:pass@proxy.example.com:8080
+# https://proxy.example.com:8443
