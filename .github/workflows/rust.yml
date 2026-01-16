@@ -88,12 +88,18 @@ jobs:
       - name: Prepare assets
         run: |
           mkdir assets
-          # For each platform's artifacts, we want to create a zip/tarball containing main.lua and the binary
+          # For each platform's artifacts, we want to create a zip/tarball containing mitm_rust_proxy.lua and the binary
           for dir in artifacts/*; do
             platform=$(basename "$dir")
             echo "Packaging $platform..."
             mkdir -p "pkg/$platform/mpv-mitm-proxy"
             cp "$dir"/* "pkg/$platform/mpv-mitm-proxy/"
+            
+            # Restore executable permissions for non-Windows binaries
+            # (permissions are lost when artifacts are uploaded/downloaded)
+            if [[ "$platform" != *"windows"* ]]; then
+              chmod +x "pkg/$platform/mpv-mitm-proxy/mpv-mitm-proxy"
+            fi
             
             if [[ "$platform" == *"windows"* ]]; then
               (cd "pkg/$platform" && zip -r "../../assets/$platform.zip" .)
