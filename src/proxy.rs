@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::task::AbortHandle;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -25,11 +26,11 @@ use url::Url;
 
 use crate::certificate::CertificateAuthority;
 
-const CHUNK_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
+const CHUNK_SIZE: u64 = 10 * 1024 * 1024; 
 const CONNECTION_POOL_SIZE: usize = 100;
 const CONNECTION_TTL: Duration = Duration::from_secs(60);
 const DNS_CACHE_SIZE: usize = 256;
-const DNS_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+const DNS_CACHE_TTL: Duration = Duration::from_secs(300); 
 
 #[derive(Error, Debug)]
 pub enum ProxyError {
@@ -50,13 +51,30 @@ pub enum ProxyError {
 }
 
 struct PooledConnection {
-    sender: SendRequest<Incoming>,
+    sender: Option<SendRequest<Incoming>>,
     created_at: Instant,
+    abort_handle: AbortHandle,
 }
 
 impl PooledConnection {
     fn is_valid(&self) -> bool {
-        self.created_at.elapsed() < CONNECTION_TTL
+        self.created_at.elapsed() < CONNECTION_TTL && self.sender.is_some()
+    }
+    
+    fn take(mut self) -> Option<(SendRequest<Incoming>, AbortHandle)> {
+        self.sender.take().map(|sender| {
+            let handle = std::mem::replace(
+                &mut self.abort_handle, 
+                tokio::task::spawn(async {}).abort_handle()
+            );
+            (sender, handle)
+        })
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
     }
 }
 
@@ -83,7 +101,7 @@ impl ConnectionPool {
         }
     }
 
-    fn get(&self, host: &str, port: u16, is_tls: bool) -> Option<SendRequest<Incoming>> {
+    fn get(&self, host: &str, port: u16, is_tls: bool) -> Option<(SendRequest<Incoming>, AbortHandle)> {
         let key = ConnKey {
             host: host.to_string(),
             port,
@@ -98,14 +116,16 @@ impl ConnectionPool {
                 state.0.put(key.clone(), ());
 
                 if conn.is_valid() {
-                    return Some(conn.sender);
+                    if let Some(result) = conn.take() {
+                        return Some(result);
+                    }
                 }
             }
         }
         None
     }
 
-    fn put(&self, host: String, port: u16, is_tls: bool, sender: SendRequest<Incoming>) {
+    fn put(&self, host: String, port: u16, is_tls: bool, sender: SendRequest<Incoming>, abort_handle: AbortHandle) {
         let key = ConnKey { host, port, is_tls };
         
         {
@@ -120,6 +140,7 @@ impl ConnectionPool {
             }
             
             if state.1 >= CONNECTION_POOL_SIZE {
+                abort_handle.abort();
                 return;
             }
             
@@ -129,8 +150,9 @@ impl ConnectionPool {
 
         let entry = self.pool.entry(key).or_insert_with(|| Mutex::new(Vec::with_capacity(4)));
         entry.value().lock().push(PooledConnection {
-            sender,
+            sender: Some(sender),
             created_at: Instant::now(),
+            abort_handle,
         });
     }
 
@@ -158,6 +180,7 @@ struct BodyWithPoolReturn {
     pool: Arc<ConnectionPool>,
     host_port_tls: Option<(String, u16, bool)>,
     sender: Option<SendRequest<Incoming>>,
+    abort_handle: Option<AbortHandle>,
 }
 
 impl BodyWithPoolReturn {
@@ -168,20 +191,22 @@ impl BodyWithPoolReturn {
         port: u16,
         is_tls: bool,
         sender: SendRequest<Incoming>,
+        abort_handle: AbortHandle,
     ) -> Self {
         Self {
             inner,
             pool,
             host_port_tls: Some((host, port, is_tls)),
             sender: Some(sender),
+            abort_handle: Some(abort_handle),
         }
     }
 
     fn return_to_pool(&mut self) {
-        if let (Some(sender), Some((host, port, is_tls))) =
-            (self.sender.take(), self.host_port_tls.take())
+        if let (Some(sender), Some((host, port, is_tls)), Some(abort_handle)) =
+            (self.sender.take(), self.host_port_tls.take(), self.abort_handle.take())
         {
-            self.pool.put(host, port, is_tls, sender);
+            self.pool.put(host, port, is_tls, sender, abort_handle);
         }
     }
 }
@@ -202,6 +227,9 @@ impl Body for BodyWithPoolReturn {
             }
             Poll::Ready(Some(Err(e))) => {
                 self.sender.take();
+                if let Some(handle) = self.abort_handle.take() {
+                    handle.abort();
+                }
                 Poll::Ready(Some(Err(e)))
             }
             other => other,
@@ -218,17 +246,22 @@ impl Body for BodyWithPoolReturn {
 }
 
 impl Drop for BodyWithPoolReturn {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(handle) = self.abort_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
-// DNS cache entry with TTL
 struct DnsCacheEntry {
-    addrs: Vec<IpAddr>,
+    result: Result<Vec<IpAddr>, String>,
     expires_at: Instant,
+    stale_at: Instant,
 }
 
 struct DnsCache {
-    cache: Mutex<LruCache<String, DnsCacheEntry>>,
+    cache: Mutex<LruCache<String, Arc<DnsCacheEntry>>>,
+    inflight: DashMap<String, tokio::sync::watch::Receiver<Option<Result<Vec<IpAddr>, String>>>>,
 }
 
 impl DnsCache {
@@ -237,26 +270,37 @@ impl DnsCache {
             cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(DNS_CACHE_SIZE).unwrap(),
             )),
+            inflight: DashMap::new(),
         }
     }
 
-    fn get(&self, host: &str) -> Option<Vec<IpAddr>> {
+    fn get(&self, host: &str) -> (Option<Result<Vec<IpAddr>, String>>, bool) {
         let mut cache = self.cache.lock();
         if let Some(entry) = cache.get(host) {
-            if entry.expires_at > Instant::now() {
-                return Some(entry.addrs.clone());
+            let now = Instant::now();
+            if now < entry.expires_at {
+                return (Some(entry.result.clone()), false);
+            } else if now < entry.stale_at {
+                return (Some(entry.result.clone()), true);
             }
-
             cache.pop(host);
         }
-        None
+        (None, false)
     }
 
-    fn put(&self, host: String, addrs: Vec<IpAddr>) {
-        let entry = DnsCacheEntry {
-            addrs,
-            expires_at: Instant::now() + DNS_CACHE_TTL,
+    fn put(&self, host: String, result: Result<Vec<IpAddr>, String>) {
+        let now = Instant::now();
+        let (ttl, stale_ttl) = if result.is_ok() {
+            (DNS_CACHE_TTL, DNS_CACHE_TTL * 2)
+        } else {
+            (Duration::from_secs(30), Duration::from_secs(60)) 
         };
+
+        let entry = Arc::new(DnsCacheEntry {
+            result,
+            expires_at: now + ttl,
+            stale_at: now + stale_ttl,
+        });
         self.cache.lock().put(host, entry);
     }
 }
@@ -287,7 +331,7 @@ struct UpstreamProxy {
 }
 
 impl ProxyConfig {
-    pub fn new(upstream_url: Option<String>, ca: Arc<CertificateAuthority>, direct_cdn: bool) -> Self {
+    pub fn new(upstream_url: Option<String>, ca: Arc<CertificateAuthority>, direct_cdn: bool) -> Arc<Self> {
         let upstream_proxy = upstream_url.and_then(|url_str| {
             let url = Url::parse(&url_str).ok()?;
             let scheme = url.scheme();
@@ -340,7 +384,7 @@ impl ProxyConfig {
             }
         });
 
-        Self {
+        let config = Arc::new(Self {
             upstream_proxy,
             ca,
             tls_client_config,
@@ -349,66 +393,116 @@ impl ProxyConfig {
             client_http1_builder,
             server_http1_builder,
             direct_cdn,
-        }
+        });
+
+        let config_clone = Arc::clone(&config);
+        tokio::spawn(async move {
+            let domains = ["www.youtube.com", "youtube.com"];
+            for domain in domains {
+                let _ = config_clone.perform_dns_lookup(domain.to_string()).await;
+            }
+        });
+
+        config
     }
 
-    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr, ProxyError> {
-        if let Some(addrs) = self.dns_cache.get(host) {
-            if let Some(ip) = addrs.first() {
-                return Ok(SocketAddr::new(*ip, port));
+    async fn resolve_host(self: &Arc<Self>, host: &str, port: u16) -> Result<Vec<SocketAddr>, ProxyError> {
+        let (cached, is_stale) = self.dns_cache.get(host);
+        
+        if let Some(result) = cached {
+            if is_stale {
+                let self_clone = Arc::clone(self);
+                let host_owned = host.to_string();
+                tokio::spawn(async move {
+                    let _ = self_clone.perform_dns_lookup(host_owned).await;
+                });
+            }
+            return match result {
+                Ok(ips) => Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()),
+                Err(e) => Err(ProxyError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e))),
+            };
+        }
+
+        let ips = self.perform_dns_lookup(host.to_string()).await?;
+        Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
+    }
+
+    async fn perform_dns_lookup(&self, host: String) -> Result<Vec<IpAddr>, ProxyError> {
+        use dashmap::mapref::entry::Entry;
+        
+        let rx = match self.dns_cache.inflight.entry(host.clone()) {
+            Entry::Occupied(occ) => occ.get().clone(),
+            Entry::Vacant(vac) => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                vac.insert(rx.clone());
+                
+                let host_clone = host.clone();
+                let dns_cache = Arc::clone(&self.dns_cache);
+                tokio::spawn(async move {
+                    let host_for_lookup = host_clone.clone();
+                    let res: Result<Vec<IpAddr>, String> = tokio::task::spawn_blocking(move || {
+                        (host_for_lookup.as_str(), 0u16)
+                            .to_socket_addrs()
+                            .map(|iter| {
+                                let ips: Vec<IpAddr> = iter.map(|addr| addr.ip()).collect();
+                                if ips.is_empty() {
+                                    Err(format!("No addresses found for {}", host_for_lookup))
+                                } else {
+                                    Ok(ips)
+                                }
+                            })
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+
+                    dns_cache.put(host_clone.clone(), res.clone());
+                    let _ = tx.send(Some(res));
+                    dns_cache.inflight.remove(&host_clone);
+                });
+                rx
+            }
+        };
+
+        let mut rx = rx;
+        loop {
+            if let Some(res) = rx.borrow().clone() {
+                return res.map_err(|e| ProxyError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e)));
+            }
+            if rx.changed().await.is_err() {
+                return Err(ProxyError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "DNS lookup task dropped",
+                )));
             }
         }
-
-
-        let host_owned = host.to_string();
-        let addrs: Vec<IpAddr> = tokio::task::spawn_blocking(move || {
-            (host_owned.as_str(), 0u16)
-                .to_socket_addrs()
-                .map(|iter| iter.map(|addr| addr.ip()).collect())
-                .unwrap_or_default()
-        })
-        .await
-        .unwrap_or_default();
-
-        if addrs.is_empty() {
-            return Err(ProxyError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("DNS resolution failed for {}", host),
-            )));
-        }
-
-        // Cache the result
-        let ip = addrs[0];
-        self.dns_cache.put(host.to_string(), addrs);
-        Ok(SocketAddr::new(ip, port))
     }
 
     #[inline]
-    async fn connect(&self, host: &str, port: u16) -> Result<TcpStream, ProxyError> {
-        let connect_fut = async {
-
-            let use_direct = self.direct_cdn && host.ends_with("googlevideo.com");
+    async fn connect(self: &Arc<Self>, host: &str, port: u16) -> Result<TcpStream, ProxyError> {
+        let self_clone = Arc::clone(self);
+        let host_owned = host.to_string();
+        let connect_fut = async move {
+            let use_direct = self_clone.direct_cdn && host_owned.ends_with("googlevideo.com");
             
-            match &self.upstream_proxy {
+            match &self_clone.upstream_proxy {
                 Some(proxy) if !use_direct => {
-
-                    let proxy_addr = self.resolve_host(&proxy.host, proxy.port).await?;
+                    let proxy_addrs = self_clone.resolve_host(&proxy.host, proxy.port).await?;
                     
                     match proxy.proxy_type {
                         ProxyType::Socks5 => {
-
                             let stream = match (&proxy.username, &proxy.password) {
                                 (Some(user), Some(pass)) => {
                                     Socks5Stream::connect_with_password(
-                                        proxy_addr,
-                                        (host, port),
+                                        proxy_addrs.as_slice(),
+                                        (host_owned.as_str(), port),
                                         user,
                                         pass,
                                     )
                                     .await?
                                 }
                                 _ => {
-                                    Socks5Stream::connect(proxy_addr, (host, port)).await?
+                                    Socks5Stream::connect(proxy_addrs.as_slice(), (host_owned.as_str(), port)).await?
                                 }
                             };
                             let tcp_stream = stream.into_inner();
@@ -416,10 +510,8 @@ impl ProxyConfig {
                             Ok(tcp_stream)
                         }
                         ProxyType::Http => {
-
-                            let mut tcp_stream = TcpStream::connect(proxy_addr).await?;
+                            let mut tcp_stream = TcpStream::connect(proxy_addrs.as_slice()).await?;
                             let _ = tcp_stream.set_nodelay(true);
-                            
 
                             let connect_req = if let (Some(user), Some(pass)) = (&proxy.username, &proxy.password) {
                                 use base64::Engine;
@@ -427,27 +519,44 @@ impl ProxyConfig {
                                     .encode(format!("{}:{}", user, pass));
                                 format!(
                                     "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Authorization: Basic {}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
-                                    host, port, host, port, credentials
+                                    host_owned, port, host_owned, port, credentials
                                 )
                             } else {
                                 format!(
                                     "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
-                                    host, port, host, port
+                                    host_owned, port, host_owned, port
                                 )
                             };
                             
                             tcp_stream.write_all(connect_req.as_bytes()).await?;
-                            
 
                             let mut buf = [0u8; 1024];
-                            let n = tcp_stream.read(&mut buf).await?;
-                            let response = String::from_utf8_lossy(&buf[..n]);
+                            let mut pos = 0;
                             
+                            loop {
+                                let n = tcp_stream.read(&mut buf[pos..]).await?;
+                                if n == 0 {
+                                    return Err(ProxyError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "HTTP proxy closed connection during handshake",
+                                    )));
+                                }
+                                pos += n;
+                                
+                                if buf[..pos].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                                
+                                if pos == buf.len() {
+                                    break; 
+                                }
+                            }
 
-                            if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+                            if !buf[..pos].starts_with(b"HTTP/1.1 200") && !buf[..pos].starts_with(b"HTTP/1.0 200") {
+                                let first_line = buf[..pos].split(|&b| b == b'\n').next().unwrap_or(&[]);
                                 return Err(ProxyError::Io(std::io::Error::new(
                                     std::io::ErrorKind::ConnectionRefused,
-                                    format!("HTTP proxy CONNECT failed: {}", response.lines().next().unwrap_or("")),
+                                    format!("HTTP proxy CONNECT failed: {}", String::from_utf8_lossy(first_line).trim()),
                                 )));
                             }
                             
@@ -456,9 +565,8 @@ impl ProxyConfig {
                     }
                 }
                 _ => {
-
-                    let addr = self.resolve_host(host, port).await?;
-                    let tcp_stream = TcpStream::connect(addr).await?;
+                    let addrs = self_clone.resolve_host(&host_owned, port).await?;
+                    let tcp_stream = TcpStream::connect(addrs.as_slice()).await?;
                     let _ = tcp_stream.set_nodelay(true);
                     Ok(tcp_stream)
                 }
@@ -477,15 +585,18 @@ impl ProxyConfig {
     }
 
     async fn get_or_create_connection(
-        &self,
+        self: &Arc<Self>,
         host_str: &str,
         port: u16,
         is_tls: bool,
-    ) -> Result<SendRequest<Incoming>, ProxyError> {
-        while let Some(mut sender) = self.connection_pool.get(host_str, port, is_tls) {
+    ) -> Result<(SendRequest<Incoming>, AbortHandle), ProxyError> {
+        while let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls) {
             match sender.ready().await {
-                Ok(_) => return Ok(sender),
-                Err(_) => continue,
+                Ok(_) => return Ok((sender, abort_handle)),
+                Err(_) => {
+                    abort_handle.abort();
+                    continue;
+                }
             }
         }
 
@@ -499,18 +610,26 @@ impl ProxyConfig {
                 .map_err(|_| ProxyError::InvalidUri(Cow::Borrowed("Invalid server name")))?;
             let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
             let upstream_io = TokioIo::new(upstream_tls);
-            let (sender, conn) = self.client_http1_builder.handshake(upstream_io).await?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            Ok(sender)
+            match self.client_http1_builder.handshake(upstream_io).await {
+                Ok((sender, conn)) => {
+                    let handle = tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    Ok((sender, handle.abort_handle()))
+                }
+                Err(e) => Err(ProxyError::Hyper(e)),
+            }
         } else {
             let upstream_io = TokioIo::new(upstream_tcp);
-            let (sender, conn) = self.client_http1_builder.handshake(upstream_io).await?;
-            tokio::spawn(async move {
-                let _ = conn.await;
-            });
-            Ok(sender)
+            match self.client_http1_builder.handshake(upstream_io).await {
+                Ok((sender, conn)) => {
+                    let handle = tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    Ok((sender, handle.abort_handle()))
+                }
+                Err(e) => Err(ProxyError::Hyper(e)),
+            }
         }
     }
 }
@@ -591,13 +710,16 @@ async fn handle_connect(
     let upgrade_fut = hyper::upgrade::on(req);
 
     tokio::spawn(async move {
-        tokio::task::yield_now().await;
         match upgrade_fut.await {
             Ok(upgraded) => {
                 let upgraded_io = TokioIo::new(upgraded);
-                let _ = handle_tunnel(upgraded_io, &host_clone, port, config).await;
+                if let Err(e) = handle_tunnel(upgraded_io, &host_clone, port, config).await {
+                    eprintln!("Tunnel error for {}:{}: {}", host_clone, port, e);
+                }
             }
-            Err(_) => {}
+            Err(e) => {
+                eprintln!("Upgrade error for {}:{}: {}", host_clone, port, e);
+            }
         }
     });
 
@@ -616,9 +738,23 @@ fn extract_host_port(uri: &Uri) -> Result<(String, u16), ProxyError> {
 
     if let Some(authority) = uri.authority() {
         let auth_str = authority.as_str();
+        if auth_str.starts_with('[') {
+            if let Some(end_bracket) = auth_str.find(']') {
+                let host = &auth_str[1..end_bracket];
+                let rest = &auth_str[end_bracket + 1..];
+                if rest.starts_with(':') {
+                    if let Ok(port) = rest[1..].parse::<u16>() {
+                        return Ok((host.to_string(), port));
+                    }
+                }
+                return Ok((host.to_string(), 443));
+            }
+        }
+
         if let Some(idx) = auth_str.rfind(':') {
-            if let Ok(port) = auth_str[idx + 1..].parse::<u16>() {
-                return Ok((auth_str[..idx].to_string(), port));
+            let (host, port_str) = auth_str.split_at(idx);
+            if let Ok(port) = port_str[1..].parse::<u16>() {
+                return Ok((host.to_string(), port));
             }
         }
         return Ok((auth_str.to_string(), 443));
@@ -754,7 +890,7 @@ async fn forward_request(
     strip_hop_by_hop_headers(&mut req);
     modify_request_headers(&mut req, host);
 
-    let mut sender = config.get_or_create_connection(host, port, is_tls).await?;
+    let (mut sender, abort_handle) = config.get_or_create_connection(host, port, is_tls).await?;
 
     let default_port = if is_tls { 443 } else { 80 };
     let host_header = if port == default_port {
@@ -780,7 +916,13 @@ async fn forward_request(
     parts.headers.insert(header::HOST, host_header);
 
     let req = Request::from_parts(parts, body);
-    let resp = sender.send_request(req).await?;
+    let resp = match sender.send_request(req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            abort_handle.abort();
+            return Err(e.into());
+        }
+    };
 
     let (parts, incoming_body) = resp.into_parts();
 
@@ -799,9 +941,11 @@ async fn forward_request(
             port,
             is_tls,
             sender,
+            abort_handle,
         );
         Ok(Response::from_parts(parts, body.map_err(|e| e).boxed()))
     } else {
+        abort_handle.abort();
         Ok(Response::from_parts(
             parts,
             incoming_body.map_err(|e| e).boxed(),
@@ -877,10 +1021,6 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        CACHED_SIG_SCHEMES.clone()
+        SUPPORTED_SIG_SCHEMES.to_vec()
     }
-}
-
-lazy_static::lazy_static! {
-    static ref CACHED_SIG_SCHEMES: Vec<rustls::SignatureScheme> = SUPPORTED_SIG_SCHEMES.to_vec();
 }
