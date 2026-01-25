@@ -210,6 +210,26 @@ start_proxy_background = function()
     if mitm_job then cleanup() end
     local bin = find_binary()
     if not bin then return end
+
+    -- Check if binary is executable and works
+    local test_res = mp.command_native({
+        name = "subprocess",
+        args = {bin, "init"},
+        capture_stdout = true,
+        capture_stderr = true,
+        playback_only = false
+    })
+    if not test_res or test_res.status ~= 0 then
+        local err = (test_res and test_res.error) or "unknown error"
+        local status = (test_res and test_res.status) or "N/A"
+        local stderr = (test_res and test_res.stderr) or ""
+        local stdout = (test_res and test_res.stdout) or ""
+        mp.msg.error(string.format("[mpv_mitm_proxy] Subprocess failed: init (error: %s, status: %s)", err, status))
+        if stdout ~= "" then mp.msg.error("Stdout: " .. stdout) end
+        if stderr ~= "" then mp.msg.error("Stderr: " .. stderr) end
+        return
+    end
+
     local upstream = nil
     if opts.use_proxies then
         upstream = get_next_proxy()
@@ -233,6 +253,8 @@ start_proxy_background = function()
     if opts.direct_cdn then
         table.insert(args, "--direct-cdn")
     end
+    proxy_port = port_attempt
+    apply_proxy_settings()
     mitm_job = mp.command_native_async({
         name = "subprocess",
         args = args,
@@ -240,10 +262,16 @@ start_proxy_background = function()
         capture_stderr = true,
         playback_only = false
     }, function(success, result, error)
+        if not success or (result and result.status ~= 0) then
+            local err_msg = "Proxy subprocess failed"
+            if error then err_msg = err_msg .. ": " .. error end
+            if result and result.status then err_msg = err_msg .. " (status: " .. result.status .. ")" end
+            if result and result.stderr then mp.msg.error("Proxy stderr: " .. result.stderr) end
+            mp.msg.error(err_msg)
+        end
         proxy_ready = false
         mitm_job = nil
     end)
-    proxy_port = port_attempt
     
     local check_count = 0
     local function wait_ready()
