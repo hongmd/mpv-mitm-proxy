@@ -131,8 +131,10 @@ local function apply_proxy_settings()
     end
     local px = "http://127.0.0.1:" .. proxy_port
     mp.set_property("file-local-options/http-proxy", px)
-    local ytdl_opts = 'proxy=' .. px .. ',force-ipv4=,no-check-certificates=,extractor-args="youtube:player_client=default,ios,-android_sdkless;formats=missing_pot",format="bv[protocol=m3u8_native]+ba[protocol=m3u8_native]/b[protocol=m3u8_native]"'
-    mp.set_property("file-local-options/ytdl-raw-options", ytdl_opts)
+    mp.set_property("file-local-options/ytdl-raw-options",
+        "proxy=" .. px .. "," ..
+        "force-ipv4=," ..
+        "no-check-certificates=,")
 end
 
 local start_proxy_background
