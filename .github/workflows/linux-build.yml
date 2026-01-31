@@ -45,4 +45,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: mpv-mitm-proxy-linux
-        path: assets/*
+        path: assets

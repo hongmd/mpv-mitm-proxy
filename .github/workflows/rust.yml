@@ -79,7 +79,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        path: dist/mpv-mitm-proxy/*
+        path: dist/
 
   release:
     name: Create Release
