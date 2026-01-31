@@ -320,6 +320,7 @@ pub struct ProxyConfig {
     client_http1_builder: hyper::client::conn::http1::Builder,
     server_http1_builder: hyper::server::conn::http1::Builder,
     direct_cdn: bool,
+    pub bypass_chunk_modification: bool,
 }
 
 struct UpstreamProxy {
@@ -331,7 +332,12 @@ struct UpstreamProxy {
 }
 
 impl ProxyConfig {
-    pub fn new(upstream_url: Option<String>, ca: Arc<CertificateAuthority>, direct_cdn: bool) -> Arc<Self> {
+    pub fn new(
+        upstream_url: Option<String>,
+        ca: Arc<CertificateAuthority>,
+        direct_cdn: bool,
+        bypass_chunk_modification: bool,
+    ) -> Arc<Self> {
         let upstream_proxy = upstream_url.and_then(|url_str| {
             let url = Url::parse(&url_str).ok()?;
             let scheme = url.scheme();
@@ -393,6 +399,7 @@ impl ProxyConfig {
             client_http1_builder,
             server_http1_builder,
             direct_cdn,
+            bypass_chunk_modification,
         });
 
         let config_clone = Arc::clone(&config);
@@ -888,7 +895,14 @@ async fn forward_request(
     config: Arc<ProxyConfig>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, ProxyError> {
     strip_hop_by_hop_headers(&mut req);
-    modify_request_headers(&mut req, host);
+
+    if config.bypass_chunk_modification {
+        if host.ends_with("googlevideo.com") {
+            println!("[PROXY] Bypassing chunk modification for {}", host);
+        }
+    } else if modify_request_headers(&mut req, host) {
+        println!("[PROXY] Modified Range header for {}", host);
+    }
 
     let (mut sender, abort_handle) = config.get_or_create_connection(host, port, is_tls).await?;
 

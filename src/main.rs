@@ -36,9 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty());
 
     let direct_cdn = args.iter().any(|a| a == "--direct-cdn");
+    let bypass_chunk_modification = args.iter().any(|a| a == "--bypass-chunk-modification");
 
     let ca = Arc::new(CertificateAuthority::new()?);
-    let config = ProxyConfig::new(upstream_proxy, ca, direct_cdn);
+    let config = ProxyConfig::new(upstream_proxy, ca, direct_cdn, bypass_chunk_modification);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], listen_port));
     let listener = TcpListener::bind(addr).await?;
