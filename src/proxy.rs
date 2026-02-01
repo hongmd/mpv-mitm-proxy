@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -63,6 +64,7 @@ impl PooledConnection {
     
     fn take(mut self) -> Option<(SendRequest<Incoming>, AbortHandle)> {
         self.sender.take().map(|sender| {
+            // Return the actual abort handle - don't replace with dummy
             let handle = std::mem::replace(
                 &mut self.abort_handle, 
                 tokio::task::spawn(async {}).abort_handle()
@@ -70,6 +72,7 @@ impl PooledConnection {
             (sender, handle)
         })
     }
+    
 }
 
 impl Drop for PooledConnection {
@@ -88,6 +91,7 @@ struct ConnKey {
 struct ConnectionPool {
     pool: DashMap<ConnKey, Mutex<Vec<PooledConnection>>>,
     state: Mutex<(LruCache<ConnKey, ()>, usize)>,
+    connection_count: AtomicUsize,
 }
 
 impl ConnectionPool {
@@ -98,6 +102,7 @@ impl ConnectionPool {
                 LruCache::new(std::num::NonZeroUsize::new(CONNECTION_POOL_SIZE).unwrap()),
                 0,
             )),
+            connection_count: AtomicUsize::new(0),
         }
     }
 
@@ -111,14 +116,21 @@ impl ConnectionPool {
         if let Some(entry) = self.pool.get(&key) {
             let mut conns = entry.value().lock();
             while let Some(conn) = conns.pop() {
-                let mut state = self.state.lock();
-                state.1 = state.1.saturating_sub(1);
-                state.0.put(key.clone(), ());
-
                 if conn.is_valid() {
                     if let Some(result) = conn.take() {
+                        // Only decrement counters for valid connections being taken
+                        let mut state = self.state.lock();
+                        state.1 = state.1.saturating_sub(1);
+                        self.connection_count.fetch_sub(1, Ordering::SeqCst);
+                        state.0.put(key.clone(), ());
                         return Some(result);
                     }
+                } else {
+                    // Connection expired - decrement counters and abort
+                    let mut state = self.state.lock();
+                    state.1 = state.1.saturating_sub(1);
+                    self.connection_count.fetch_sub(1, Ordering::SeqCst);
+                    conn.abort_handle.abort();
                 }
             }
         }
@@ -128,20 +140,35 @@ impl ConnectionPool {
     fn put(&self, host: String, port: u16, is_tls: bool, sender: SendRequest<Incoming>, abort_handle: AbortHandle) {
         let key = ConnKey { host, port, is_tls };
         
+        let mut current = self.connection_count.load(Ordering::SeqCst);
+        loop {
+            if current >= CONNECTION_POOL_SIZE {
+                // Pool is full, abort the connection
+                abort_handle.abort();
+                return;
+            }
+            match self.connection_count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        
         {
             let mut state = self.state.lock();
+            // Also maintain the LRU cache within the state mutex
             if state.1 >= CONNECTION_POOL_SIZE {
                 if let Some((old_key, _)) = state.0.pop_lru() {
                     if let Some((_, conns_mutex)) = self.pool.remove(&old_key) {
                         let removed_count = conns_mutex.lock().len();
                         state.1 = state.1.saturating_sub(removed_count);
+                        self.connection_count.fetch_sub(removed_count, Ordering::SeqCst);
                     }
                 }
-            }
-            
-            if state.1 >= CONNECTION_POOL_SIZE {
-                abort_handle.abort();
-                return;
             }
             
             state.1 += 1;
@@ -171,6 +198,7 @@ impl ConnectionPool {
         if total_removed > 0 {
             let mut state = self.state.lock();
             state.1 = state.1.saturating_sub(total_removed);
+            self.connection_count.fetch_sub(total_removed, Ordering::SeqCst);
         }
     }
 }
@@ -247,8 +275,12 @@ impl Body for BodyWithPoolReturn {
 
 impl Drop for BodyWithPoolReturn {
     fn drop(&mut self) {
-        if let Some(handle) = self.abort_handle.take() {
-            handle.abort();
+        // Only abort if the connection wasn't returned to pool
+        // (sender is None means it was returned)
+        if self.sender.is_some() {
+            if let Some(handle) = self.abort_handle.take() {
+                handle.abort();
+            }
         }
     }
 }
@@ -321,6 +353,7 @@ pub struct ProxyConfig {
     server_http1_builder: hyper::server::conn::http1::Builder,
     direct_cdn: bool,
     pub bypass_chunk_modification: bool,
+    pub debug: bool,
 }
 
 struct UpstreamProxy {
@@ -337,6 +370,7 @@ impl ProxyConfig {
         ca: Arc<CertificateAuthority>,
         direct_cdn: bool,
         bypass_chunk_modification: bool,
+        debug: bool,
     ) -> Arc<Self> {
         let upstream_proxy = upstream_url.and_then(|url_str| {
             let url = Url::parse(&url_str).ok()?;
@@ -400,6 +434,7 @@ impl ProxyConfig {
             server_http1_builder,
             direct_cdn,
             bypass_chunk_modification,
+            debug,
         });
 
         let config_clone = Arc::clone(&config);
@@ -418,9 +453,13 @@ impl ProxyConfig {
         
         if let Some(result) = cached {
             if is_stale {
+                // Use perform_dns_lookup which has proper inflight coordination
+                // This prevents multiple concurrent stale refreshes for the same hostname
                 let self_clone = Arc::clone(self);
                 let host_owned = host.to_string();
                 tokio::spawn(async move {
+                    // perform_dns_lookup uses DashMap entry API to ensure only one
+                    // lookup task is spawned per hostname
                     let _ = self_clone.perform_dns_lookup(host_owned).await;
                 });
             }
@@ -464,6 +503,7 @@ impl ProxyConfig {
                     .unwrap_or_else(|e| Err(e.to_string()));
 
                     dns_cache.put(host_clone.clone(), res.clone());
+                    // Always remove inflight entry, even if all receivers dropped
                     let _ = tx.send(Some(res));
                     dns_cache.inflight.remove(&host_clone);
                 });
@@ -476,10 +516,13 @@ impl ProxyConfig {
             if let Some(res) = rx.borrow().clone() {
                 return res.map_err(|e| ProxyError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, e)));
             }
+            // Check if sender dropped (all receivers gone) - clean up and return error
             if rx.changed().await.is_err() {
+                // Remove the stale inflight entry
+                self.dns_cache.inflight.remove(&host);
                 return Err(ProxyError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    "DNS lookup task dropped",
+                    "DNS lookup cancelled",
                 )));
             }
         }
@@ -489,8 +532,28 @@ impl ProxyConfig {
     async fn connect(self: &Arc<Self>, host: &str, port: u16) -> Result<TcpStream, ProxyError> {
         let self_clone = Arc::clone(self);
         let host_owned = host.to_string();
+        
+        if self_clone.debug {
+            eprintln!("[PROXY DEBUG] Connecting to {}:{}", host_owned, port);
+            eprintln!("[PROXY DEBUG] upstream_proxy is_none: {}", self_clone.upstream_proxy.is_none());
+            eprintln!("[PROXY DEBUG] direct_cdn: {}", self_clone.direct_cdn);
+        }
+
         let connect_fut = async move {
             let use_direct = self_clone.direct_cdn && host_owned.ends_with("googlevideo.com");
+            
+            if self_clone.debug {
+                if use_direct {
+                    eprintln!("[PROXY DEBUG] Using DIRECT connection for {} (direct_cdn=true and googlevideo.com)", host_owned);
+                } else {
+                    match &self_clone.upstream_proxy {
+                        Some(proxy) => eprintln!("[PROXY DEBUG] Using {} proxy {}:{} for {}", 
+                            match proxy.proxy_type { ProxyType::Socks5 => "SOCKS5", ProxyType::Http => "HTTP" },
+                            proxy.host, proxy.port, host_owned),
+                        None => eprintln!("[PROXY DEBUG] Using DIRECT connection for {} (no upstream proxy configured)", host_owned),
+                    }
+                }
+            }
             
             match &self_clone.upstream_proxy {
                 Some(proxy) if !use_direct => {
@@ -539,6 +602,8 @@ impl ProxyConfig {
 
                             let mut buf = [0u8; 1024];
                             let mut pos = 0;
+                            #[allow(unused_assignments)]
+                            let mut header_end = 0;
                             
                             loop {
                                 let n = tcp_stream.read(&mut buf[pos..]).await?;
@@ -550,22 +615,40 @@ impl ProxyConfig {
                                 }
                                 pos += n;
                                 
-                                if buf[..pos].windows(4).any(|w| w == b"\r\n\r\n") {
+                                if let Some(idx) = buf[..pos].windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_end = idx + 4;
                                     break;
                                 }
                                 
                                 if pos == buf.len() {
-                                    break; 
+                                    // Buffer full without finding headers - invalid response
+                                    return Err(ProxyError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "HTTP proxy response too large or malformed",
+                                    )));
                                 }
                             }
 
-                            if !buf[..pos].starts_with(b"HTTP/1.1 200") && !buf[..pos].starts_with(b"HTTP/1.0 200") {
-                                let first_line = buf[..pos].split(|&b| b == b'\n').next().unwrap_or(&[]);
+                            // Ensure we found valid headers before checking
+                            if header_end == 0 {
+                                return Err(ProxyError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "HTTP proxy response missing headers",
+                                )));
+                            }
+
+                            // Check response status using only the header portion
+                            if !buf[..header_end].starts_with(b"HTTP/1.1 200") && !buf[..header_end].starts_with(b"HTTP/1.0 200") {
+                                let first_line = buf[..header_end].split(|&b| b == b'\n').next().unwrap_or(&[]);
                                 return Err(ProxyError::Io(std::io::Error::new(
                                     std::io::ErrorKind::ConnectionRefused,
                                     format!("HTTP proxy CONNECT failed: {}", String::from_utf8_lossy(first_line).trim()),
                                 )));
                             }
+                            
+                            // Note - any data after headers (buf[header_end..pos]) 
+                            // would typically be the start of TLS handshake from the upstream.
+                            // This is expected behavior for CONNECT tunneling.
                             
                             Ok(tcp_stream)
                         }
@@ -613,9 +696,24 @@ impl ProxyConfig {
         if is_tls {
             let host = host_str.to_string();
             let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls_client_config));
-            let server_name = rustls::pki_types::ServerName::try_from(host)
+            // Remove brackets from IPv6 for ServerName (SNI doesn't use brackets)
+            let server_name_str = if host.starts_with('[') && host.ends_with(']') {
+                &host[1..host.len()-1]
+            } else {
+                &host
+            };
+            let server_name = rustls::pki_types::ServerName::try_from(server_name_str.to_string())
                 .map_err(|_| ProxyError::InvalidUri(Cow::Borrowed("Invalid server name")))?;
-            let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+            let upstream_tls = match tokio::time::timeout(
+                Duration::from_secs(10),
+                connector.connect(server_name, upstream_tcp)
+            ).await {
+                Ok(res) => res?,
+                Err(_) => return Err(ProxyError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("TLS handshake to {} timed out", host_str),
+                ))),
+            };
             let upstream_io = TokioIo::new(upstream_tls);
             match self.client_http1_builder.handshake(upstream_io).await {
                 Ok((sender, conn)) => {
@@ -740,6 +838,7 @@ async fn handle_connect(
 fn extract_host_port(uri: &Uri) -> Result<(String, u16), ProxyError> {
     if let Some(host) = uri.host() {
         let port = uri.port_u16().unwrap_or(443);
+        // Preserve IPv6 brackets in host for proper SNI and Host header usage
         return Ok((host.to_string(), port));
     }
 
@@ -747,7 +846,8 @@ fn extract_host_port(uri: &Uri) -> Result<(String, u16), ProxyError> {
         let auth_str = authority.as_str();
         if auth_str.starts_with('[') {
             if let Some(end_bracket) = auth_str.find(']') {
-                let host = &auth_str[1..end_bracket];
+                // Keep brackets for IPv6 addresses (required for Host header and SNI)
+                let host = &auth_str[..=end_bracket];
                 let rest = &auth_str[end_bracket + 1..];
                 if rest.starts_with(':') {
                     if let Ok(port) = rest[1..].parse::<u16>() {
@@ -784,11 +884,20 @@ where
 {
     let tls_config = config
         .ca
-        .get_server_config(host)
+        .get_server_config(host).await
         .map_err(|e| ProxyError::Tls(rustls::Error::General(e.to_string())))?;
 
     let acceptor = TlsAcceptor::from(tls_config);
-    let client_tls = acceptor.accept(upgraded).await?;
+    let client_tls = match tokio::time::timeout(
+        Duration::from_secs(10),
+        acceptor.accept(upgraded)
+    ).await {
+        Ok(res) => res?,
+        Err(_) => return Err(ProxyError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "TLS client handshake timed out",
+        ))),
+    };
     let client_io = TokioIo::new(client_tls);
     let host_owned = host.to_string();
 
@@ -841,11 +950,27 @@ fn modify_request_headers<T>(req: &mut Request<T>, host: &str) -> bool {
     };
 
     let range_bytes = range_header.as_bytes();
-    if range_bytes.len() < 8 || !range_bytes.starts_with(b"bytes=") || !range_bytes.ends_with(b"-") {
+    // Handle both "bytes=X-" (open-ended) and "bytes=-X" (suffix) ranges
+    if range_bytes.len() < 8 || !range_bytes.starts_with(b"bytes=") {
         return false;
     }
 
-    let start_bytes = &range_bytes[6..range_bytes.len() - 1];
+    let range_spec = &range_bytes[6..]; // Everything after "bytes="
+    
+    // Check for suffix range: "bytes=-N" (get last N bytes)
+    if range_spec.starts_with(b"-") {
+        // Suffix range - let it pass through unmodified
+        // These are typically "bytes=-500" to get last 500 bytes
+        return false; // Don't modify suffix ranges
+    }
+    
+    // Check for open-ended range: "bytes=X-"
+    if !range_spec.ends_with(b"-") {
+        // Already has an end byte or is a multi-range request - don't modify
+        return false;
+    }
+
+    let start_bytes = &range_spec[..range_spec.len() - 1];
     if start_bytes.is_empty() || start_bytes.contains(&b'-') {
         return false;
     }
@@ -898,10 +1023,10 @@ async fn forward_request(
 
     if config.bypass_chunk_modification {
         if host.ends_with("googlevideo.com") {
-            println!("[PROXY] Bypassing chunk modification for {}", host);
+            if config.debug { println!("[PROXY] Bypassing chunk modification for {}", host); }
         }
     } else if modify_request_headers(&mut req, host) {
-        println!("[PROXY] Modified Range header for {}", host);
+        if config.debug { println!("[PROXY] Modified Range header for {}", host); }
     }
 
     let (mut sender, abort_handle) = config.get_or_create_connection(host, port, is_tls).await?;
