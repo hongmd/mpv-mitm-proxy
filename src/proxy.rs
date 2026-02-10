@@ -58,7 +58,7 @@ const CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 const CONNECTION_POOL_SIZE: usize = 100;
 const CONNECTION_TTL: Duration = Duration::from_secs(60);
 const DNS_CACHE_SIZE: usize = 256;
-const DNS_CACHE_TTL: Duration = Duration::from_secs(300); 
+const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Error, Debug)]
 pub enum ProxyError {
@@ -313,14 +313,9 @@ impl Body for BodyWithPoolReturn {
 
 impl Drop for BodyWithPoolReturn {
     fn drop(&mut self) {
-        // If body wasn't completed (returned to pool or errored),
-        // give a grace period before aborting to prevent data truncation
-        if !self.completed && self.sender.is_some() {
+        if !self.healthy && self.sender.is_some() {
             if let Some(handle) = self.abort_handle.take() {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    handle.abort();
-                });
+                handle.abort();
             }
         }
     }
@@ -385,18 +380,6 @@ impl Body for BodyWithAbortOnEnd {
 
 impl Drop for BodyWithAbortOnEnd {
     fn drop(&mut self) {
-        // Only abort if the body wasn't fully consumed
-        // If the body completed normally, the abort already happened in poll_frame
-        if !self.completed {
-            // Give a small grace period for any in-flight data to be processed
-            // before aborting the connection
-            if let Some(handle) = self.abort_handle.take() {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    handle.abort();
-                });
-            }
-        }
     }
 }
 
@@ -435,7 +418,7 @@ impl DnsCache {
         }
         (None, false)
     }
-    
+
     /// Remove a stale entry from the cache to force a fresh lookup
     fn remove(&self, host: &str) {
         let mut cache = self.cache.lock();
@@ -447,7 +430,7 @@ impl DnsCache {
         let (ttl, stale_ttl) = if result.is_ok() {
             (DNS_CACHE_TTL, DNS_CACHE_TTL * 2)
         } else {
-            (Duration::from_secs(30), Duration::from_secs(60)) 
+            (Duration::from_secs(30), Duration::from_secs(60))
         };
 
         let entry = Arc::new(DnsCacheEntry {
@@ -574,7 +557,7 @@ impl ProxyConfig {
 
     async fn resolve_host(self: &Arc<Self>, host: &str, port: u16) -> Result<Vec<SocketAddr>, ProxyError> {
         let (cached, is_stale) = self.dns_cache.get(host);
-        
+
         if let Some(result) = cached {
             if is_stale {
                 // Spawn background refresh for stale entries
@@ -599,13 +582,13 @@ impl ProxyConfig {
 
     async fn perform_dns_lookup(&self, host: String) -> Result<Vec<IpAddr>, ProxyError> {
         use dashmap::mapref::entry::Entry;
-        
+
         let rx = match self.dns_cache.inflight.entry(host.clone()) {
             Entry::Occupied(occ) => occ.get().clone(),
             Entry::Vacant(vac) => {
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 vac.insert(rx.clone());
-                
+
                 let host_clone = host.clone();
                 let dns_cache = Arc::clone(&self.dns_cache);
                 tokio::spawn(async move {
@@ -613,7 +596,7 @@ impl ProxyConfig {
                     let _cleanup = scopeguard::guard((dns_cache.clone(), host_clone.clone()), |(dc, h)| {
                         dc.inflight.remove(&h);
                     });
-                    
+
                     let host_for_lookup = host_clone.clone();
                     let res: Result<Vec<IpAddr>, String> = tokio::task::spawn_blocking(move || {
                         (host_for_lookup.as_str(), 0u16)
@@ -661,7 +644,7 @@ impl ProxyConfig {
     async fn connect(self: &Arc<Self>, host: &str, port: u16) -> Result<TcpStream, ProxyError> {
         let self_clone = Arc::clone(self);
         let host_owned = host.to_string();
-        
+
         if self_clone.debug {
             eprintln!("[PROXY DEBUG] Connecting to {}:{}", host_owned, port);
             eprintln!("[PROXY DEBUG] upstream_proxy is_none: {}", self_clone.upstream_proxy.is_none());
@@ -670,24 +653,24 @@ impl ProxyConfig {
 
         let connect_fut = async move {
             let use_direct = self_clone.direct_cdn && host_owned.ends_with("googlevideo.com");
-            
+
             if self_clone.debug {
                 if use_direct {
                     eprintln!("[PROXY DEBUG] Using DIRECT connection for {} (direct_cdn=true and googlevideo.com)", host_owned);
                 } else {
                     match &self_clone.upstream_proxy {
-                        Some(proxy) => eprintln!("[PROXY DEBUG] Using {} proxy {}:{} for {}", 
+                        Some(proxy) => eprintln!("[PROXY DEBUG] Using {} proxy {}:{} for {}",
                             match proxy.proxy_type { ProxyType::Socks5 => "SOCKS5", ProxyType::Http => "HTTP" },
                             proxy.host, proxy.port, host_owned),
                         None => eprintln!("[PROXY DEBUG] Using DIRECT connection for {} (no upstream proxy configured)", host_owned),
                     }
                 }
             }
-            
+
             match &self_clone.upstream_proxy {
                 Some(proxy) if !use_direct => {
                     let proxy_addrs = self_clone.resolve_host(&proxy.host, proxy.port).await?;
-                    
+
                     match proxy.proxy_type {
                         ProxyType::Socks5 => {
                             let stream = match (&proxy.username, &proxy.password) {
@@ -728,7 +711,7 @@ impl ProxyConfig {
                                     host_owned, port, host_owned, port
                                 )
                             };
-                            
+
                             tcp_stream.write_all(connect_req.as_bytes()).await?;
                             read_http_connect_status(&mut tcp_stream).await?;
                             Ok(tcp_stream)
@@ -764,13 +747,13 @@ impl ProxyConfig {
     ) -> Result<(SendRequest<Incoming>, AbortHandle), ProxyError> {
         let mut attempts = 0;
         const MAX_POOL_ATTEMPTS: u32 = 3;
-        
+
         let upstream_proxy = self.upstream_proxy.is_some();
-        
+
         while attempts < MAX_POOL_ATTEMPTS {
             if let Some((mut sender, abort_handle)) = self.connection_pool.get(host_str, port, is_tls, upstream_proxy) {
                 attempts += 1;
-                
+
                 // ready() can hang if connection is in bad state, so use timeout
                 match tokio::time::timeout(Duration::from_millis(100), sender.ready()).await {
                     Ok(Ok(_)) => {
